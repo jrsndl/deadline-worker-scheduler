@@ -1,0 +1,6 @@
+{
+    "path_team": ".",
+    "path_ignore_people": "./ignore_people.txt",
+    "path_ignore_workers": "./ignore_machines.txt",
+    "worker_info_folder": "./worker_info"
+}
