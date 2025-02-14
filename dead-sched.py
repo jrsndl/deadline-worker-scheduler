@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from logging import getLogger, StreamHandler, DEBUG
+
 logger = getLogger(__name__)
 handler = StreamHandler()
 handler.setLevel(DEBUG)
@@ -54,7 +55,16 @@ def external_execute(args):
     return popen_stdout, popen_stderr, popen.returncode
 
 class WorkerSchedule:
-    def __init__(self, logger=logger):
+    def __init__(self, args, logger=logger):
+
+        """
+        {'check': True,
+         'comments_only': False,
+         'dry': False,
+         'use_comments': False,
+         'workstations_render': False}
+        """
+        self.args = args
 
         self.logger = logger
         self.deadline_path = None
@@ -442,11 +452,11 @@ class WorkerSchedule:
                         'is_artist': is_artist,
                         'usr': usr,
                         'occupation': occ,
-                        'comment_prev': info['Comment'],
+                        'comment': info['Comment'],
                         'state': info['SlaveState'],
                         'user_active': False,
                         'team_user_found': False,
-                        'comment': ''
+                        'enabled': bool(info['SlaveEnabled'])
                         }
             workers[worker] = new_info
         return users, workers
@@ -470,37 +480,38 @@ class WorkerSchedule:
         IP - ignore it (do not use for render), it is in ignore people list
         """
 
-        for worker, info in self.workers_parsed.items():
+        if not self.args['use_comments']:
+            for worker, info in self.workers_parsed.items():
 
-            if worker in self.ignore_machines:
-                info['comment'] = 'Ignore - Machine'
-                continue
-            if info['type'] == 'R':
-                info['comment'] = 'Render Node'
-                continue
+                if worker in self.ignore_machines:
+                    info['comment'] = 'Ignore - Machine'
+                    continue
+                if info['type'] == 'R':
+                    info['comment'] = 'Render Node'
+                    continue
 
-            if info['type'] == 'W':
-                if not info['is_artist']:
-                    # artist name was not parsed
-                    info['comment'] = 'Free Workstation'
-                    continue
-                if info['usr'] in self.ignore_people:
-                    # parsed artist name deems this machine to not be used for renders
-                    info['comment'] = 'Ignore - User'
-                    continue
-                if not info['team_user_found']:
-                    # parsed artist name was not found in team names
-                    # consider it free
-                    info['comment'] = 'Free Workstation - User not found in team'
-                    continue
-                if info['user_active']:
-                    # parsed artist name deems this machine to not be used for renders
-                    info['comment'] = 'Workstation in use in working hours'
-                    continue
-                if not info['user_active']:
-                    # parsed artist name in team csv states this machine can be used today
-                    info['comment'] = 'Paused - User not active'
-                    continue
+                if info['type'] == 'W':
+                    if not info['is_artist']:
+                        # artist name was not parsed
+                        info['comment'] = 'Free Workstation'
+                        continue
+                    if info['usr'] in self.ignore_people:
+                        # parsed artist name deems this machine to not be used for renders
+                        info['comment'] = 'Ignore - User'
+                        continue
+                    if not info['team_user_found']:
+                        # parsed artist name was not found in team names
+                        # consider it free
+                        info['comment'] = 'Free Workstation - User not found in team'
+                        continue
+                    if info['user_active']:
+                        # parsed artist name deems this machine to not be used for renders
+                        info['comment'] = 'Workstation in use in working hours'
+                        continue
+                    if not info['user_active']:
+                        # parsed artist name in team csv states this machine can be used today
+                        info['comment'] = 'Paused - User not active'
+                        continue
 
     def comment_to_deadline(self):
         for worker, info in self.workers_parsed.items():
@@ -511,8 +522,13 @@ class WorkerSchedule:
                     self.logger.error(f"Setting Comment to slave {worker} failed with return code {return_code}")
 
     def slave_enabled_by_comment(self):
-        enabled_firsts = ['f', 'p', 'r', 'w']
+
+        enabled_firsts = ['f', 'p', 'r']
         disabled_firsts = ['i']
+        if self.args['workstations_render']:
+            enabled_firsts.append('w')
+        else:
+            disabled_firsts.append('w')
         for worker, info in self.workers_parsed.items():
             if info['comment'] != '':
                 first = info['comment'][0].lower()
@@ -520,10 +536,12 @@ class WorkerSchedule:
                     slave_enabled = 'True'
                 else:
                     slave_enabled = 'False'
-                cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveEnabled', slave_enabled]
-                _out, _err, return_code = external_execute(cmd)
-                if return_code != 0:
-                    self.logger.error(f"Setting slave {worker} enabled to {slave_enabled} failed with return code {return_code}")
+                self.workers_parsed[worker]['slave_enabled'] = slave_enabled
+                if not self.args['comments_only'] and not self.args['dry']:
+                    cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveEnabled', slave_enabled]
+                    _out, _err, return_code = external_execute(cmd)
+                    if return_code != 0:
+                        self.logger.error(f"Setting slave {worker} enabled to {slave_enabled} failed with return code {return_code}")
 
 def get_args():
     parser = argparse.ArgumentParser(description="Uses DeadlineCommand to control if slaves are enabled or not.\nReads team attendance csv and exceptions (machines and users to be skipped) sets the Deadline comments accordingly, and enables or disables Deadline workers by the comments")
@@ -552,14 +570,6 @@ def get_args():
     parser.set_defaults(workstations_render=False)
 
     parser.add_argument(
-        '--no_workstations_render',
-        action='store_false',
-        help="Disable worker on workstations. For working hours.",
-        required=False
-    )
-    parser.set_defaults(no_workstations_render=True)
-
-    parser.add_argument(
         '--dry',
         action = 'store_true',
         help="Display results but do not execute them.",
@@ -575,15 +585,12 @@ def get_args():
     )
     parser.set_defaults(check=True)
 
-
     return parser.parse_args()
 
 if __name__ == "__main__":
 
     args = vars(get_args())
-    ws = WorkerSchedule(args)
+    ws = WorkerSchedule(args, logger)
     pprint(ws.workers_parsed)
-    print("\n\n")
 
-    #pprint(ws.team_data)
 
