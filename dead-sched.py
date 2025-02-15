@@ -66,6 +66,10 @@ class WorkerSchedule:
         """
         self.args = args
 
+        # used to speed up the debug
+        # can read cached json file instead of deadline read
+        self.skip_reading_from_Deadline = False
+
         self.logger = logger
         self.deadline_path = None
         self.current_folder = self.get_current_folder()
@@ -75,6 +79,7 @@ class WorkerSchedule:
         self.path_ignore_workers = None
         self.worker_info_folder = None
 
+        # read team data
         self.get_setup()
         self.current_team_file = None
         self.get_current_team_file()
@@ -85,58 +90,88 @@ class WorkerSchedule:
             self.logger.error("-=Failed=-")
             return
 
+        # read machines and users to be ignored (will not render)
         self.ignore_people = []
         self.get_ignored_names()
         self.ignore_machines = []
         self.get_ignored_machines()
 
-        # read from Deadline
+        # read workers info from Deadline
         self.workers = []
         self.workers_info = {}
-
         self.get_deadline_info()
         if not self.workers or not self.workers_info:
             self.logger.error("Reading worker info from Deadline failed.")
             self.checks_ok = False
 
-        # workers parsed contains selected info
+        # workers_parsed to contain necessary info from parsed workers_info
         self.users_to_workers, self.workers_parsed = self.parse_description_from_info()
         # this sets if user is active or not by matching team name to worker parsed artist name
         # also sets team_user_found for workers with matching user (team member)
         self.assign_team_member_to_worker_by_name()
 
         # decide if worker should render 24/7, overnight, or not render at all
-        # write the result to worker comment
+        # write the result to worker comment in workers_parsed
         self.assign_comment_to_workers()
 
         # write the worker comment back to deadline
         self.comment_to_deadline()
 
-        # enable or disable workers by the comment
+        # deadline enable or disable workers by the comment, also store in workers_parsed
         self.slave_enabled_by_comment()
+
+        # read back enabled / disabled from Deadline, compare to expected and report
+        self.check_if_set()
 
         # write workers_parsed to json file with today date
         self.workers_parsed_to_json()
 
+    def str_to_bool(self, s):
+        if s == 'True':
+            return True
+        elif s == 'False':
+            return False
+        else:
+            raise ValueError
+
+    def _read_deadline_info(self):
+
+        _workers = []
+        _workers_info = {}
+
+        _workers = self.get_workers()
+        if not _workers:
+            self.logger.error("Reading worker names from Deadline failed.")
+            return _workers, _workers_info
+        self.logger.debug(f"Reading {len(_workers)} worker's info from Deadline. This can take some time...")
+        for worker in _workers:
+            #print(".", end="")
+            _workers_info[worker] = self._get_worker_info(worker)
+
+        return _workers, _workers_info
+
     def get_deadline_info(self):
+
         my_json = self.worker_info_folder + os.sep + datetime.datetime.now().strftime("%y%m%d") + ".json"
-        try:
-            with open(my_json, "r") as json_file:
-                self.workers_info = json.load(json_file)
-                self.workers = list(self.workers_info.keys())
-        except Exception:
-            self.logger.info(f"Failed to read worker info from json file: {my_json}")
+        if self.skip_reading_from_Deadline:
+            # try to read from cached json first
+            try:
+                with open(my_json, "r") as json_file:
+                    self.workers_info = json.load(json_file)
+                    self.workers = list(self.workers_info.keys())
+            except Exception as e:
+                self.logger.info(f"Failed to read worker info from json file: {my_json}. {e}")
 
         if self.workers_info == {}:
-            self.workers = self.get_workers()
+            self.workers, self.workers_info = self._read_deadline_info()
             if not self.workers:
                 self.logger.error("Reading worker names from Deadline failed.")
                 return
-            self.logger.debug("Reading worker info from Deadline. This can take few minutes...")
-            for worker in self.workers:
-                print(".", end="")
-                self.workers_info[worker] = self._get_worker_info(worker)
-            self.worker_info_to_json(my_json)
+            if self.workers_info == {}:
+                self.logger.error("Reading workers info from Deadline failed.")
+                return
+            if self.skip_reading_from_Deadline:
+                self.worker_info_to_json(my_json)
 
     def worker_info_to_json(self, my_json):
         try:
@@ -456,7 +491,9 @@ class WorkerSchedule:
                         'state': info['SlaveState'],
                         'user_active': False,
                         'team_user_found': False,
-                        'enabled': bool(info['SlaveEnabled'])
+                        'read_enabled': self.str_to_bool(info['SlaveEnabled']),
+                        'slave_to_be_enabled': None,
+                        'check_enabled': None
                         }
             workers[worker] = new_info
         return users, workers
@@ -472,54 +509,81 @@ class WorkerSchedule:
 
     def assign_comment_to_workers(self):
         """
+        Comments explained:
         R - (Render node) it is a render node, use it all the time render on 27/7
+        IM - ignore it (do not use for render), it is in ignore machines list
+        IU - ignore it (do not use for render), it is in ignore user list
+        F - (Free) it is a workstation not used by any artist, render on 24/7
         W - (artist Working) it is a workstation used by artist - only use it for night renders
         P - (Paused) it is a workstation used by artists that is not active today, render on 24/7
-        F - (Free) it is a workstation not used by any artist, render on 24/7
-        IM - ignore it (do not use for render), it is in ignore machines list
-        IP - ignore it (do not use for render), it is in ignore people list
+
+        Note that only lowercase sof first letter is used for enabling / disabling the slave
         """
+        comments = {
+            'r': 'Render Node',
+            'im': 'Ignore - Machine',
+            'f': 'Free Workstation',
+            'iu': 'Ignore - User',
+            'fnt': 'Free Workstation - User not found in team',
+            'w': 'Workstation in use in working hours',
+            'p': 'Paused - User not active',
+        }
 
         if not self.args['use_comments']:
             for worker, info in self.workers_parsed.items():
 
                 if worker in self.ignore_machines:
-                    info['comment'] = 'Ignore - Machine'
+                    info['comment'] = comments['im']
                     continue
                 if info['type'] == 'R':
-                    info['comment'] = 'Render Node'
+                    info['comment'] = comments['r']
                     continue
 
                 if info['type'] == 'W':
                     if not info['is_artist']:
                         # artist name was not parsed
-                        info['comment'] = 'Free Workstation'
-                        continue
-                    if info['usr'] in self.ignore_people:
+                        info['comment'] = comments['f']
+                    elif info['usr'] in self.ignore_people:
                         # parsed artist name deems this machine to not be used for renders
-                        info['comment'] = 'Ignore - User'
-                        continue
-                    if not info['team_user_found']:
+                        info['comment'] = comments['iu']
+                    elif not info['team_user_found']:
                         # parsed artist name was not found in team names
                         # consider it free
-                        info['comment'] = 'Free Workstation - User not found in team'
+                        info['comment'] = comments['fnt']
+                    elif info['user_active']:
+                        # artist uses this workstation today
+                        info['comment'] = comments['w']
                         continue
-                    if info['user_active']:
-                        # parsed artist name deems this machine to not be used for renders
-                        info['comment'] = 'Workstation in use in working hours'
-                        continue
-                    if not info['user_active']:
+                    elif not info['user_active']:
                         # parsed artist name in team csv states this machine can be used today
-                        info['comment'] = 'Paused - User not active'
-                        continue
+                        info['comment'] = comments['p']
 
     def comment_to_deadline(self):
-        for worker, info in self.workers_parsed.items():
-            if info['comment'] != '':
-                cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveComment', info['comment']]
-                _out, _err, return_code = external_execute(cmd)
-                if return_code != 0:
-                    self.logger.error(f"Setting Comment to slave {worker} failed with return code {return_code}")
+        if not self.args['use_comments']:
+            for worker, info in self.workers_parsed.items():
+                if info['comment'] != '':
+                    cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveComment', info['comment']]
+                    _out, _err, return_code = external_execute(cmd)
+                    if return_code != 0:
+                        self.logger.error(f"Setting Comment to slave {worker} failed with return code {return_code}")
+        else:
+            self.logger.debug("Skipping comment to deadline, use_comments argument is set to True")
+
+    def check_if_set(self):
+        if self.args['check']:
+            matching_workers = []
+            not_matching_workers = []
+            for worker, info in self.workers_parsed.items():
+                if info['slave_to_be_enabled'] is not None:
+                    fresh_info = self._get_worker_info(worker)
+                    info['check_enabled'] = self.str_to_bool(fresh_info['SlaveEnabled'])
+                    if info['slave_to_be_enabled'] == info['check_enabled']:
+                        matching_workers.append(worker)
+                    else:
+                        not_matching_workers.append(worker)
+
+            self.logger.info(f"Check found {len(matching_workers)} workers set correctly and {len(not_matching_workers)} workers set wrongly.")
+
 
     def slave_enabled_by_comment(self):
 
@@ -536,7 +600,7 @@ class WorkerSchedule:
                     slave_enabled = 'True'
                 else:
                     slave_enabled = 'False'
-                self.workers_parsed[worker]['slave_enabled'] = slave_enabled
+                self.workers_parsed[worker]['slave_to_be_enabled'] = self.str_to_bool(slave_enabled)
                 if not self.args['comments_only'] and not self.args['dry']:
                     cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveEnabled', slave_enabled]
                     _out, _err, return_code = external_execute(cmd)
