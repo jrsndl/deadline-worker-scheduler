@@ -5,18 +5,27 @@ import datetime
 import json
 import os
 import platform
+
 import re
 import subprocess
 import sys
-from logging import getLogger, StreamHandler, DEBUG
+from logging import getLogger, StreamHandler
 
-logger = getLogger(__name__)
-handler = StreamHandler()
-handler.setLevel(DEBUG)
-logger.setLevel(DEBUG)
-logger.addHandler(handler)
+import pprint
 
-from pprint import pprint
+def make_logging(lvl):
+    lvls = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+    lvl = lvl.upper()
+    if lvl not in lvls:
+        lvl = "WARNING"
+
+    logger = getLogger(__name__)
+    handler = StreamHandler()
+    handler.setLevel(lvl)
+    logger.setLevel(lvl)
+    logger.addHandler(handler)
+
+    return logger
 
 def get_deadline_executable():
     pth = None
@@ -55,9 +64,9 @@ def external_execute(args):
     return popen_stdout, popen_stderr, popen.returncode
 
 class WorkerSchedule:
-    def __init__(self, args, logger=logger):
-
+    def __init__(self, args, logger):
         """
+        Some arguments to be passed in args:
         {'check': True,
          'comments_only': False,
          'dry': False,
@@ -126,6 +135,9 @@ class WorkerSchedule:
         # write workers_parsed to json file with today date
         self.workers_parsed_to_json()
 
+        my_json = self.worker_info_folder + os.sep + datetime.datetime.now().strftime("%y%m%d") + ".json"
+        self.worker_info_to_json(my_json)
+
     def str_to_bool(self, s):
         if s == 'True':
             return True
@@ -143,7 +155,7 @@ class WorkerSchedule:
         if not _workers:
             self.logger.error("Reading worker names from Deadline failed.")
             return _workers, _workers_info
-        self.logger.debug(f"Reading {len(_workers)} worker's info from Deadline. This can take some time...")
+        self.logger.info(f"Reading {len(_workers)} worker's info from Deadline. This can take some time...")
         for worker in _workers:
             #print(".", end="")
             _workers_info[worker] = self._get_worker_info(worker)
@@ -172,6 +184,8 @@ class WorkerSchedule:
                 return
             if self.skip_reading_from_Deadline:
                 self.worker_info_to_json(my_json)
+            self.logger.info(f"Info about {len(self.workers)} was read from Deadline.")
+
 
     def worker_info_to_json(self, my_json):
         try:
@@ -260,7 +274,7 @@ class WorkerSchedule:
         # Get the current file location, even if the script is frozen (e.g., built with pyinstaller)
         if getattr(sys, 'frozen', False):
             # If the application is run as a frozen executable
-            current_file_location = os.path.dirname(sys.executable)
+            current_file_location = sys.executable
         else:
             # If the application is run in a standard Python environment
             current_file_location = os.path.abspath(__file__)
@@ -500,12 +514,31 @@ class WorkerSchedule:
 
     def assign_team_member_to_worker_by_name(self):
         team_members = list(self.team_data.keys())
+        team_members_not_assigned = list(self.team_data.keys())
+        worker_user_not_in_team = []
+        matched_team_members = 0
         for worker, info in self.workers_parsed.items():
             if not info['is_artist']:
                 continue
             if info['usr'] in team_members:
                 info['team_user_found'] = True
+                try:
+                    team_members_not_assigned.remove(info['usr'])
+                except ValueError:
+                    pass
                 info['user_active'] = self.team_data[info['usr']]
+                matched_team_members += 1
+            else:
+                worker_user_not_in_team.append(info['usr'])
+
+        self.logger.info(f"{matched_team_members} team members matched to workers.")
+        if len(team_members_not_assigned) > 0:
+            self.logger.info(f"{len(team_members_not_assigned)} team members not matched to workers:")
+            self.logger.info(pprint.pformat(team_members_not_assigned))
+        if len(worker_user_not_in_team) > 0:
+            self.logger.debug(f"{len(worker_user_not_in_team)} worker users not matched to team:")
+            self.logger.debug(pprint.pformat(team_members_not_assigned))
+
 
     def assign_comment_to_workers(self):
         """
@@ -530,6 +563,7 @@ class WorkerSchedule:
         }
 
         if not self.args['use_comments']:
+            self.logger.info("Making Comments by team attendance")
             for worker, info in self.workers_parsed.items():
 
                 if worker in self.ignore_machines:
@@ -560,12 +594,17 @@ class WorkerSchedule:
 
     def comment_to_deadline(self):
         if not self.args['use_comments']:
-            for worker, info in self.workers_parsed.items():
-                if info['comment'] != '':
-                    cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveComment', info['comment']]
-                    _out, _err, return_code = external_execute(cmd)
-                    if return_code != 0:
-                        self.logger.error(f"Setting Comment to slave {worker} failed with return code {return_code}")
+            if self.args['dry']:
+                self.logger.info("Dry run, not setting comment to deadline")
+                return
+            else:
+                self.logger.info("Setting Comments to Deadline")
+                for worker, info in self.workers_parsed.items():
+                    if info['comment'] != '':
+                        cmd = [self.deadline_path, "-SetSlaveSetting", worker, 'SlaveComment', info['comment']]
+                        _out, _err, return_code = external_execute(cmd)
+                        if return_code != 0:
+                            self.logger.error(f"Setting Comment to slave {worker} failed with return code {return_code}")
         else:
             self.logger.debug("Skipping comment to deadline, use_comments argument is set to True")
 
@@ -590,9 +629,26 @@ class WorkerSchedule:
         enabled_firsts = ['f', 'p', 'r']
         disabled_firsts = ['i']
         if self.args['workstations_render']:
+            self.logger.info("\n-=Enabling Workstations Render=-\n")
             enabled_firsts.append('w')
         else:
+            self.logger.info("\n-=Disabling Workstations Render=-\n")
             disabled_firsts.append('w')
+
+        # make sure workers are launched first
+        # separate loop to give deadline some time
+        if not self.args['comments_only'] and not self.args['dry']:
+            for worker, info in self.workers_parsed.items():
+                if info['comment'] != '':
+                    first = info['comment'][0].lower()
+                    if first in enabled_firsts:
+                        self.logger.debug(f"Launching Slave {worker}")
+                        cmd = [self.deadline_path, "-RemoteControl", worker, 'LaunchSlave']
+                        _out, _err, return_code = external_execute(cmd)
+                        if return_code != 0:
+                            self.logger.error(f"Launching Slave {worker} failed with return code {return_code}")
+
+        # now enable the slaves
         for worker, info in self.workers_parsed.items():
             if info['comment'] != '':
                 first = info['comment'][0].lower()
@@ -611,16 +667,16 @@ def get_args():
     parser = argparse.ArgumentParser(description="Uses DeadlineCommand to control if slaves are enabled or not.\nReads team attendance csv and exceptions (machines and users to be skipped) sets the Deadline comments accordingly, and enables or disables Deadline workers by the comments")
     parser.add_argument(
         '--comments_only',
+        action='store_true',
         help="Sets comments but doesn't enable/disable workers.",
-        type=str,
         required=False
     )
     parser.set_defaults(comments_only=False)
 
     parser.add_argument(
         '--use_comments',
+        action='store_true',
         help="Enable/disable workers by existing comments read from the Deadline.",
-        type=str,
         required=False
     )
     parser.set_defaults(use_comments=False)
@@ -649,12 +705,20 @@ def get_args():
     )
     parser.set_defaults(check=True)
 
+    parser.add_argument(
+        '-log',
+        '--log_level',
+        default='DEBUG',
+        help='Set the logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)'
+    )
+
     return parser.parse_args()
 
 if __name__ == "__main__":
 
     args = vars(get_args())
-    ws = WorkerSchedule(args, logger)
-    pprint(ws.workers_parsed)
+    log = make_logging(args['log_level'])
+    ws = WorkerSchedule(args, log)
+
 
 

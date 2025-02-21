@@ -1,0 +1,8 @@
+# Default ignored files
+/.git/
+/.idea/
+/build/
+/dist/
+/worker_info/
+dead-sched.exe
+make_exe.bat
