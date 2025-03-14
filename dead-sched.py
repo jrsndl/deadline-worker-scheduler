@@ -9,9 +9,41 @@ import platform
 import re
 import subprocess
 import sys
-from logging import getLogger, StreamHandler
+from logging import getLogger, StreamHandler, FileHandler, Formatter
 
 import pprint
+
+
+def get_worker_info_folder():
+    def get_current_folder():
+        # Get the current file location, even if the script is frozen (e.g., built with pyinstaller)
+        if getattr(sys, 'frozen', False):
+            # If the application is run as a frozen executable
+            current_file_location = sys.executable
+        else:
+            # If the application is run in a standard Python environment
+            current_file_location = os.path.abspath(__file__)
+        current_file_location = os.path.dirname(current_file_location)
+        return current_file_location
+
+    def to_absolute_path(relative):
+        if relative.startswith("."):
+            relative = current_folder + relative[1:]
+        return relative
+
+    # set sane defaults
+    current_folder = get_current_folder()
+    worker_info_folder = current_folder + os.sep + "worker_info"
+
+    # now try to read it from setup.json
+    try:
+        with open(current_folder + os.sep + "setup.json", "r") as json_file:
+            setup = json.load(json_file)
+            worker_info_folder = setup.get("worker_info_folder", worker_info_folder)
+            worker_info_folder = to_absolute_path(worker_info_folder).replace("\\", "/")
+    except:
+        pass
+    return worker_info_folder
 
 def make_logging(lvl):
     lvls = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -24,6 +56,13 @@ def make_logging(lvl):
     handler.setLevel(lvl)
     logger.setLevel(lvl)
     logger.addHandler(handler)
+
+    fh = FileHandler(get_worker_info_folder() + os.sep + datetime.datetime.now().strftime("%y%m%d") + ".log")
+    formatter = Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    fh.setLevel("DEBUG")
+    logger.addHandler(fh)
 
     return logger
 
@@ -365,7 +404,7 @@ class WorkerSchedule:
             meet the expected format, an empty dictionary is returned.
         :rtype: dict
         """
-        inactive = ["", "paused", "off"]
+        inactive = ["", "paused", "off", "closed"]
         if not self.current_team_file:
             return {}
         csv_path = os.path.join(self.csv_root, self.current_team_file)
@@ -558,7 +597,7 @@ class WorkerSchedule:
             'f': 'Free Workstation',
             'iu': 'Ignore - User',
             'fnt': 'Free Workstation - User not found in team',
-            'w': 'Workstation in use in working hours',
+            'w': 'Workstation in use during working hours',
             'p': 'Paused - User not active',
         }
 

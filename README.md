@@ -67,7 +67,7 @@ If first character of the path is dot, the dot is replaced with current script d
 * "path_ignore_workers": Text file where each line contains machine to be ignored (machine will not render)
 * "worker_info_folder": Folder where script exports json files with details pulled from the Deadline
 
-## The Commmand Line Arguments
+## The Command Line Arguments
 
 ### --dry
 Skips any operation that would change Deadline.
